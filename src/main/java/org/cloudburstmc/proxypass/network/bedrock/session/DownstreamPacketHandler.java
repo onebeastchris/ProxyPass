@@ -182,27 +182,39 @@ public class DownstreamPacketHandler implements BedrockPacketHandler {
                 (this.dimension == 0 ? 24 : 16) :
                 packet.getSubChunksLength();
 
-        ByteBuf buffer = packet.getData();
+        ByteBuf buffer = packet.getData().copy();
         if (packet.isRequestSubChunks()) {
-            PaletteHolder[] biomes = new PaletteHolder[subChunksCount];
-            for (int i = 0; i < biomes.length; i++) {
-                PaletteHolder palette = this.readPalettedBiomes(buffer);
-                if (palette == null && i == 0) {
-                    throw new IllegalStateException("First biome palette can not point to previous!");
-                }
+            //log.info("Is cache enabled? {}", packet.isCachingEnabled());
+            if (!packet.isCachingEnabled()) {
+                PaletteHolder[] biomes = new PaletteHolder[subChunksCount];
+                for (int i = 0; i < biomes.length; i++) {
+                    PaletteHolder palette = this.readPalettedBiomes(buffer);
+                    if (palette == null && i == 0) {
+                        throw new IllegalStateException("First biome palette can not point to previous!");
+                    }
 
-                if (palette == null) {
-                    palette = biomes[i - 1].copy();
+                    if (palette == null) {
+                        palette = biomes[i - 1].copy();
+                    }
+                    biomes[i] = palette;
                 }
-                biomes[i] = palette;
             }
 
             short borderBlocksSize = buffer.readUnsignedByte();
             buffer.skipBytes(borderBlocksSize); // 1 byte per borderBlock
 
             byte[] blockEntities = new byte[buffer.readableBytes()];
-            buffer.readBytes(blockEntities);
-            this.blockEntityMap.put(chunkIndex, blockEntities);
+            if (blockEntities.length > 0) {
+                try {
+                    NBTInputStream nbtInputStream = new NBTInputStream(new ByteBufInputStream(buffer.readBytes(blockEntities)));
+                    var b = nbtInputStream.readTag();
+                    log.info("Block entity nbt tag: {}", b);
+                } catch (Exception e) {
+                    log.error("Failed to read block entity nbt", e);
+                }
+            }
+
+            //this.blockEntityMap.put(chunkIndex, blockEntities);
         } else {
             log.info("LevelChunkPacket not requesting subchunks!");
             SubChunkHolder[] subChunks = new SubChunkHolder[subChunksCount];
@@ -325,6 +337,77 @@ public class DownstreamPacketHandler implements BedrockPacketHandler {
     }
 
     @Override
+    public PacketSignal handle(ClientCacheBlobStatusPacket packet) {
+        log.info("ClientCacheBlobStatusPacket: {} acks, {} nacks", packet.getAcks().size(), packet.getNaks().size());
+        return PacketSignal.UNHANDLED;
+    }
+
+    @Override
+    public PacketSignal handle(ClientCacheMissResponsePacket packet) {
+        packet.getBlobs().forEach((hash, buffer) -> {
+            log.info("ClientCacheMissResponsePacket: hash {}", hash);
+            int storagescount = buffer.readUnsignedByte();
+            buffer.readUnsignedByte(); // sectionY
+            PPBlockStorage[] storages = new PPBlockStorage[storagescount];
+
+            for (int y = 0; y < storagescount; y++) {
+                PPBlockStorage storage = new PPBlockStorage();
+                storage.setLegacy(false);
+                storage.setPaletteHeader(buffer.readUnsignedByte());
+                if (storage.isPersistent()) {
+                    throw new IllegalStateException("SubChunk version 8 does not support persistent storages over network!");
+                }
+
+                int paletteSize = 1;
+                if (storage.getBitsPerBlock() != 0) {
+                    // storage is 16 * 16 * 16 large
+                    int blocksPerWord = Integer.SIZE / storage.getBitsPerBlock();
+                    int wordsCount = (4096 + blocksPerWord - 1) / blocksPerWord;
+                    int[] words = new int[wordsCount];
+                    for (int i = 0; i < wordsCount; i++) {
+                        words[i] = buffer.readIntLE();
+                    }
+                    storage.setWords(words);
+                    paletteSize = VarInts.readInt(buffer);
+                }
+
+                storage.setPalette(new IntArrayList());
+                for (int i = 0; i < paletteSize; i++) {
+                    storage.getPalette().add(VarInts.readInt(buffer));
+                }
+                storages[y] = storage;
+            }
+            // storages are done!
+
+            byte[] blockEntities = blockEntityMap.get(chunkIndex);
+            if (buffer.readableBytes() > 0) {
+
+                int size = blockEntities == null ? 0 : blockEntities.length;
+                byte[] blockEntities1 = new byte[size + buffer.readableBytes()];
+
+                if (size > 0) {
+                    System.arraycopy(blockEntities, 0, blockEntities1, 0, size);
+                }
+                ByteBuf nbtbuf = buffer.readBytes(blockEntities, size, buffer.readableBytes());
+
+                // finally, juicy block entity nbt
+                try {
+                    NBTInputStream nbtInputStream = new NBTInputStream(new ByteBufInputStream(nbtbuf));
+                    var b = nbtInputStream.readTag();
+                    log.info("Block entity nbt tag: {}", b);
+                } catch (Exception e) {
+                    log.error("Failed to read block entity nbt", e);
+                } finally {
+                    nbtbuf.release();
+                }
+            }
+
+        });
+
+        return PacketSignal.UNHANDLED;
+    }
+
+    @Override
     public PacketSignal handle(SubChunkPacket packet) {
         for (SubChunkData subChunkData : packet.getSubChunks()) {
             Vector3i centerPos = packet.getCenterPosition();
@@ -339,11 +422,14 @@ public class DownstreamPacketHandler implements BedrockPacketHandler {
                 return PacketSignal.UNHANDLED;
             }
 
-            int offsetY = packet.getDimension() == 0 ? 4 : 0;
             if (result == SubChunkRequestResult.SUCCESS_ALL_AIR) {
                 // empty sub chunk
             } else {
                 // Read subchunk data
+                if (subChunkData.getBlobId() != 0 && subChunkData.isCacheEnabled()) {
+                    log.info("Blob id: {}", subChunkData.getBlobId());
+                    return PacketSignal.UNHANDLED;
+                }
                 ByteBuf buffer = subChunkData.getData();
                 int subChunkVersion = buffer.readUnsignedByte();
 
